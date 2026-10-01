@@ -330,6 +330,7 @@ Only one program should actively control the same H7-TOOL operation path at a ti
 - Writing is gated as a dangerous action: set `"dangerous_actions": {"enabled": true, "allowed_levels": ["write"], ...}` in `config.json` and pass the matching `confirmation` phrase. Reads are never gated.
 - The tool's FAT stores Chinese file names as GBK, so `path_encoding` defaults to `gbk`. Pass `utf-8` if your tree is ASCII-only.
 - The Lua file API has no delete, truncate, or mkdir call. The target directory must already exist, and a rewrite shorter than the previous file leaves the old tail in place; `device_file_write` reports that in `warnings`. Delete the file with the H7-TOOL PC software and write again.
+- Writing while another Lua script is still running on the tool can race the Lua reset that function `0x64` performs, which lands a wrong image. `verified: false` means exactly that: press **C** on the tool so no script is running, then write again. A verified write on an idle tool is byte-exact.
 - Writes larger than 16 KiB, and writes crossing a 4 KiB page, are both handled internally: one `f_write` call rejects a payload above 16 KiB, and the tool duplicates a single byte when one call crosses a 4096-byte page from an unaligned offset.
 - A Lua script itself is no longer limited to roughly 1000 bytes. Function `0x64` carries `(total length, offset, chunk length)`, so the bridge streams a large script across several 1024-byte HID reports.
 

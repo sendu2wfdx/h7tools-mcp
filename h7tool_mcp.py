@@ -3891,7 +3891,9 @@ class H7ToolMcp:
         verified = size == len(content) and read == len(content) and digest == expected_hash
         if not verified:
             warnings.append(
-                "read-back verification failed; do not trust this file. "
+                "read-back verification failed; do not trust this file. A Lua script that is still "
+                "running on the tool races the Lua reset that function 0x64 performs, which can land a "
+                "wrong image: press C on the tool to leave any running script and write again. "
                 f"size={size} read={read} hash={digest} expected_size={len(content)} expected_hash={expected_hash}"
             )
         return {
