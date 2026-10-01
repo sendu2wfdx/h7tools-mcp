@@ -27,7 +27,7 @@ from typing import Any
 
 
 SERVER_NAME = "h7tool-mcp-assistant"
-SERVER_VERSION = "0.8.0"
+SERVER_VERSION = "0.8.4"
 # H7-TOOL function 0x64 carries three uint32 fields: total length, offset and the
 # length of this chunk.  A script may therefore span several 1024-byte HID
 # reports; sending it in one report used to cap a Lua script at about 1000 bytes.
@@ -2770,10 +2770,27 @@ class H7ToolHidModbusAdapter:
         return reply[4]
 
     def native_read_window(self, path: str, offset: int, length: int) -> bytes:
-        """Read up to `length` bytes from `offset` (one or more 0x64 requests)."""
-        payload = path.encode("gbk") + b"\0"
-        total = None
+        """Read up to `length` bytes from `offset` (one or more 0x64 requests).
+
+        The device answers bytes=0 to the first request after a file has just been
+        written: measured on a fresh 48-byte file the reply carried total=48 bytes=0
+        and the immediate retry returned all 48 bytes, because the FAT directory
+        entry is not flushed yet. An empty reply is therefore retried instead of
+        being treated as end-of-file.
+        """
+        head = path.encode("gbk") + b"\0"
+        # the request's package_len doubles as the device's read length, exactly as it
+        # does for LIST, so the payload is padded to pull a full 1 KiB per round trip
+        # (an unpadded payload returns only len(path) bytes and a 20 KB read then needs
+        # hundreds of USB round trips, which trips hidapi with "read error")
+        # 256 bytes: a multiple of 32, because ReadFileToMem calls
+        # SCB_InvalidateDCache_by_Addr(_Buff, _MaxLen) and an unaligned length lets the
+        # invalidate walk into neighbouring lines - a 1000-byte read corrupted data and
+        # then hard-faulted the firmware into a watchdog reset.
+        payload = head + b"\0" * max(0, 256 - len(head))
+        total: int | None = None
         data = bytearray()
+        empty = 0
         while total is None or len(data) < min(total, offset + length):
             reply = self._native_exchange(self.NATIVE_READ_FILE, total or 0, offset + len(data), payload, 8000)
             if total is None:
@@ -2782,7 +2799,12 @@ class H7ToolHidModbusAdapter:
                     return b""
             got = struct.unpack(">I", reply[13:17])[0]
             if got == 0:
-                break
+                empty += 1
+                if empty > 4:
+                    break
+                time.sleep(0.15)
+                continue
+            empty = 0
             data += reply[17:17 + got]
             if len(data) >= length:
                 break
@@ -4154,8 +4176,13 @@ class H7ToolMcp:
         length = int(arguments.get("length", 1024))
         if offset < 0:
             raise BridgeError("offset must not be negative")
-        if not 1 <= length <= 65536:
-            raise BridgeError("length must be between 1 and 65536")
+        if not 1 <= length <= 1024:
+            raise BridgeError(
+                "length must be between 1 and 1024: longer reads are not reliable. The device "
+                "invalidates its D-cache using the requested length, so multi-chunk reads came back "
+                "with wrong content at 2048 bytes and a 1000-byte chunk hard-faulted the firmware "
+                "into a watchdog reset. Read the file in 1024-byte windows instead."
+            )
         native_path = self._native_file_path(path, path_encoding)
         data = self.hid_modbus.native_read_window(native_path, offset, length)
         text: str | None = None
