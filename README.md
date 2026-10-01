@@ -349,3 +349,29 @@ Relevant `adapter` settings:
 | `lua_chunk_bytes` | `700` | HID report payload used to stream a script; must stay under 1000 |
 | `lua_chunk_delay_ms` | `4` | Pause between script chunks |
 | `drain_before_run_ms` | `150` | Print polling done before a run, so leftovers are not reported as its output |
+
+## Screenshot
+
+`screenshot` captures the H7-TOOL's own LCD and writes it as a PNG.
+
+- function `0x66`, subfunction `0x0100` (`H66_READ_DISP_MEM`): the firmware
+  `memcpy`s straight out of the framebuffer at `0x30000000`.
+- the payload is raw RGB565 little-endian, row major, top-left origin, stride = panel
+  width, no compression: 153600 bytes for a 240x320 panel.
+- `offset` is an absolute byte offset, so a frame is read by walking `offset += chunk`
+  until `width * height * 2` bytes arrive. There is no end marker and no sequence number.
+- 1009 bytes is the largest chunk that fits one 1024-byte HID report; a whole frame took
+  about 0.26 s on APP V2.33.
+
+Two things learned the hard way: claim HID interface 2 exclusively (close the vendor PC
+application first), and drain the stale IN reports after opening - a Lua program that
+redraws the panel leaves hundreds queued, and unrelated frames such as `01 61 ...` Lua
+print frames share the same pipe, so match unit + function + subfunction + offset +
+length + CRC rather than the function byte alone.
+
+### Binary-safe file writes
+
+`device_file_write` sends each piece base64 encoded. A Lua long string can hold NUL
+bytes, but the firmware passes the whole script to `luaL_dostring()` as a C string, so a
+single NUL inside an embedded piece truncates the script and every later write silently
+does nothing.

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+import zlib
 import hashlib
 import json
 import math
@@ -26,12 +27,39 @@ from typing import Any
 
 
 SERVER_NAME = "h7tool-mcp-assistant"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.5.0"
 # H7-TOOL function 0x64 carries three uint32 fields: total length, offset and the
 # length of this chunk.  A script may therefore span several 1024-byte HID
 # reports; sending it in one report used to cap a Lua script at about 1000 bytes.
 LUA_MAX_CHUNK_BYTES = 1000
 LUA_CHUNK_BYTES = 700
+
+
+# Pieces are carried base64 encoded. A Lua long string can hold NUL bytes, but
+# the firmware hands the script to luaL_dostring() as a C string, so a single NUL
+# inside an embedded piece truncates the script and the write silently does
+# nothing. Base64 also keeps long-string delimiters out of the payload.
+B64_DECODER_LUA = b"""local B64 = {}
+do
+  local a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  for i = 1, #a do B64[string.sub(a, i, i)] = i - 1 end
+end
+local function dec(t)
+  local o, acc, bits = {}, 0, 0
+  for i = 1, #t do
+    local v = B64[string.sub(t, i, i)]
+    if v then
+      acc = acc * 64 + v
+      bits = bits + 6
+      while bits >= 8 do
+        bits = bits - 8
+        o[#o + 1] = string.char(math.floor(acc / (2 ^ bits)) % 256)
+        acc = acc % (2 ^ bits)
+      end
+    end
+  end
+  return table.concat(o)
+end"""
 # f_write() rejects a single payload larger than 16 KiB, and the tool duplicates
 # one byte when a write crosses a 4096-byte page from an unaligned start offset.
 # Writing whole pages from page-aligned offsets avoids both problems.
@@ -1159,6 +1187,35 @@ def require_dangerous_confirmation(
     if confirmation != policy["confirmation_phrase"]:
         raise BridgeError("confirmation phrase did not match the configured dangerous action policy")
     return {"allowed": True, "level": level}
+
+
+def png_from_rgb565(data: bytes, width: int, height: int) -> bytes:
+    """Encode an RGB565 little-endian framebuffer as a PNG using only stdlib."""
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)                       # PNG filter type 0
+        row = y * width * 2
+        for x in range(width):
+            index = row + 2 * x
+            value = data[index] | (data[index + 1] << 8)
+            raw.append((value & 0xF800) >> 8)
+            raw.append((value & 0x07E0) >> 3)
+            raw.append((value & 0x001F) << 3)
+
+    def block(tag: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + tag
+            + payload
+            + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + block(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + block(b"IDAT", zlib.compress(bytes(raw), 6))
+        + block(b"IEND", b"")
+    )
 
 
 def rolling_byte_hash(data: bytes) -> int:
@@ -2611,6 +2668,64 @@ class H7ToolHidModbusAdapter:
             "No matching H7-TOOL HID response. Verify the vendor PC application is closed and the tool is not in another active HID mode."
         )
 
+    def read_display(self, offset: int, length: int) -> bytes:
+        """Read a slice of the tool's own LCD framebuffer.
+
+        Function 0x66, subfunction 0x0100 (H66_READ_DISP_MEM): the firmware
+        memcpy's straight out of the framebuffer at 0x30000000, so the reply is
+        raw RGB565 little-endian, with no compression and no framing beyond the
+        echo of offset and length.
+        """
+        if not 0 <= offset <= 0xFFFFFFFF or not 1 <= length <= 1009:
+            raise BridgeError("display read needs a 32-bit offset and a length of 1..1009")
+        try:
+            import hid  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise BridgeError("H7-TOOL USB HID support needs hidapi: & $py -m pip install -r .\\mcp\\requirements.txt") from exc
+        item = self._find_interface()
+        timeout_ms = max(200, int(self.config.get("timeout_ms", 1000)))
+        unit_id = int(self.config.get("unit_id", 1))
+        body = struct.pack(">BBHII", unit_id, 0x66, 0x0100, offset, length)
+        request = body + crc16_modbus(body).to_bytes(2, "little")
+        request_report = b"\0" + request + b"\0" * (1025 - 1 - len(request))
+        dev = hid.device()
+        try:
+            dev.open_path(item["path"])
+            if offset == 0:
+                # A script that redraws the panel leaves stale replies queued
+                # (hundreds were seen), and they would be mistaken for ours.
+                for _ in range(400):
+                    if not dev.read(1024, 20):
+                        break
+            deadline = time.monotonic() + max(2.0, timeout_ms / 1000)
+            while time.monotonic() < deadline:
+                dev.write(request_report)
+                reply = bytes(dev.read(1024, 150)).rstrip(b"\0")
+                if len(reply) < 15 or reply[0] != unit_id or reply[1] != 0x66:
+                    continue
+                if reply[2:4] != b"\x01\x00":
+                    continue
+                if struct.unpack(">II", reply[4:12]) != (offset, length):
+                    continue
+                if reply[12] != 0:
+                    raise BridgeError(f"H7-TOOL reported display read error {reply[12]}")
+                data = reply[13 : 13 + length]
+                if len(data) != length:
+                    continue
+                if crc16_modbus(reply[: 13 + length]) != int.from_bytes(reply[13 + length : 15 + length], "little"):
+                    continue
+                return data
+        except BridgeError:
+            raise
+        except Exception as exc:  # hidapi has platform-specific exception types
+            raise BridgeError(f"H7-TOOL display read failed: {exc}") from exc
+        finally:
+            try:
+                dev.close()
+            except Exception:
+                pass
+        raise BridgeError("no matching H7-TOOL display read reply; close the vendor PC application and retry")
+
     def _run_lua_script(
         self,
         script: bytes,
@@ -3810,12 +3925,12 @@ class H7ToolMcp:
         script_parts = [
             b'print("H7TOOL_FILE_BEGIN")',
             b"local PATH = " + self._hid_lua_bytes(path_bytes),
+            B64_DECODER_LUA,
             b"local PIECES = {",
         ]
         for piece in pieces:
-            # The newline after [==[ is consumed by Lua, so the literal still
-            # holds the slice byte for byte when the slice starts with a newline.
-            script_parts.append(b"[==[\n" + piece + b"]==],")
+            # Base64 keeps NUL bytes out of the script: see B64_DECODER_LUA.
+            script_parts.append(b'dec("' + base64.b64encode(piece) + b'"),')
         script_parts.extend(
             [
                 b"}",
@@ -3986,6 +4101,44 @@ class H7ToolMcp:
             payload["text"] = bytes(data).decode(content_encoding, errors="replace")
         return payload
 
+    def screenshot(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Capture the tool's own LCD and write it next to the caller as a PNG."""
+        self._require_hid_adapter("screenshot")
+        width = int(arguments.get("width", 240))
+        height = int(arguments.get("height", 320))
+        if not 1 <= width <= 480 or not 1 <= height <= 480:
+            raise BridgeError("width and height must be 1..480")
+        chunk = int(arguments.get("chunk_bytes", 960))
+        chunk = max(16, min(chunk, 1009))
+        out = str(arguments.get("path", "")).strip()
+        if not out:
+            raise BridgeError("path is required, for example D:/shots/tool.png")
+        started = time.monotonic()
+        total = width * height * 2
+        frame = bytearray()
+        while len(frame) < total:
+            want = min(chunk, total - len(frame))
+            frame += self.hid_modbus.read_display(len(frame), want)
+        target = Path(out)
+        if target.parent and not target.parent.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+        png = png_from_rgb565(bytes(frame), width, height)
+        target.write_bytes(png)
+        elapsed = (time.monotonic() - started) * 1000
+        warnings: list[str] = []
+        if width * height * 2 != len(frame):
+            warnings.append("the captured frame is shorter than width*height*2")
+        return {
+            "path": str(target),
+            "width": width,
+            "height": height,
+            "framebuffer_bytes": len(frame),
+            "png_bytes": len(png),
+            "elapsed_ms": round(elapsed),
+            "kb_per_second": round(len(frame) / max(elapsed, 1), 1),
+            "warnings": warnings,
+        }
+
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "bridge_status":
             return self.status()
@@ -4107,10 +4260,38 @@ class H7ToolMcp:
             return self.device_file_write(arguments)
         if name == "device_file_read":
             return self.device_file_read(arguments)
+        if name == "screenshot":
+            return self.screenshot(arguments)
         raise BridgeError(f"Unknown tool: {name}")
 
 
 TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "screenshot",
+        "description": (
+            "Capture the H7-TOOL's own LCD and save it as a PNG. Reads the panel framebuffer with "
+            "function 0x66 subfunction 0x0100 (raw RGB565 little-endian, stride = panel width, no "
+            "compression); about 0.26 s for a 240x320 frame. Useful for checking what a Lua mini "
+            "program actually drew. Claim interface 2 exclusively: close the vendor PC application first."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "PNG file to write, for example D:/shots/tool.png"},
+                "width": {"type": "integer", "default": 240, "minimum": 1, "maximum": 480},
+                "height": {"type": "integer", "default": 320, "minimum": 1, "maximum": 480},
+                "chunk_bytes": {
+                    "type": "integer",
+                    "default": 960,
+                    "minimum": 16,
+                    "maximum": 1009,
+                    "description": "bytes per 0x66 request; 1009 is the largest that fits one HID report",
+                },
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
     {
         "name": "bridge_status",
         "description": "Show bridge configuration and available serial ports/H7-TOOL HID interfaces. Does not contact H7-TOOL.",
@@ -5017,7 +5198,7 @@ def self_test(_server: H7ToolMcp) -> int:
     assert DEVICE_FILE_PAGE_BYTES == 4096
     assert 1 <= DEVICE_FILE_MAX_READ <= 4096
     tool_names = {tool["name"] for tool in TOOLS}
-    assert {"device_file_write", "device_file_read"} <= tool_names
+    assert {"device_file_write", "device_file_read", "screenshot"} <= tool_names
     assert server._hid_lua_bytes(b"\x00\xff") == b"string.char(0,255)"
     assert server._device_path_bytes("0:/H7-TOOL/Lua/My/app.lua", "gbk") == b"0:/H7-TOOL/Lua/My/app.lua"
     assert server._device_path_bytes("0:/H7-TOOL/Lua/My/\u6a21\u62df.lua", "gbk") == (
