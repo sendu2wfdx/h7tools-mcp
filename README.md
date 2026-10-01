@@ -375,3 +375,31 @@ length + CRC rather than the function byte alone.
 bytes, but the firmware passes the whole script to `luaL_dostring()` as a C string, so a
 single NUL inside an embedded piece truncates the script and every later write silently
 does nothing.
+
+## EMMC file management (native channel)
+
+Function `0x64` carries file management in its `func` field - the same frame the Lua
+download uses - so files can be listed, deleted and created while the DAP/debug
+interface stays alive. The Lua layer cannot do this: `f_dir` crashes the firmware and
+`os.remove`/`os.rename` are silent no-ops.
+
+| func | tool | notes |
+|---|---|---|
+| 2 | `device_file_list` | line format `F<hex size>|<date> <time>|<name>`, `D` = directory |
+| 3 | `device_file_md5` | plain MD5, verified against hashlib |
+| 4 | `device_file_delete` | gated as dangerous level `write` |
+| 6 | read | reply `total(4) offset(4) bytes(4) data` |
+| 7 | write | payload `size(4) md5(16) name_len(1) full path data` |
+| 8 | `device_file_mkdir` | 0 = created, 1 = already there |
+
+Firmware quirks the client must handle:
+
+- the reply starts `func(2) result(1) total(4) offset(4) package_len(4) data`; skipping the
+  result byte shifts every later field by one;
+- `LIST` and `READ` never NUL-terminate the path they receive (`DEL` and `MD5` do);
+- `LIST` rejects a trailing slash and then returns an empty listing;
+- `LIST` reuses the request's `package_len` as its own reply length, so the payload must be
+  NUL padded to fetch a whole chunk;
+- a request may only be written once: re-sending a `WRITE_FILE` packet buffers the same
+  bytes twice and doubles the file;
+- `DEL_DIR` (5) is declared but unimplemented in the firmware.

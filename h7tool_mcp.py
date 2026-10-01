@@ -27,7 +27,7 @@ from typing import Any
 
 
 SERVER_NAME = "h7tool-mcp-assistant"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.6.0"
 # H7-TOOL function 0x64 carries three uint32 fields: total length, offset and the
 # length of this chunk.  A script may therefore span several 1024-byte HID
 # reports; sending it in one report used to cap a Lua script at about 1000 bytes.
@@ -2668,6 +2668,150 @@ class H7ToolHidModbusAdapter:
             "No matching H7-TOOL HID response. Verify the vendor PC application is closed and the tool is not in another active HID mode."
         )
 
+    # ------------------------------------------------------------------
+    #  native EMMC file management (function 0x64 sub-functions)
+    # ------------------------------------------------------------------
+    NATIVE_LIST_FILE = 2
+    NATIVE_GET_FILE_MD5 = 3
+    NATIVE_DEL_FILE = 4
+    NATIVE_READ_FILE = 6
+    NATIVE_WRITE_FILE = 7
+    NATIVE_CREATE_FOLDER = 8
+
+    def _native_exchange(self, func: int, total: int, offset: int, payload: bytes,
+                         timeout_ms: int | None = None) -> bytes:
+        """One 0x64 file-management exchange. The request is written exactly once.
+
+        Re-sending a WRITE_FILE packet makes the firmware buffer the same bytes a
+        second time (its duplicate check only compares offsets after the first
+        packet), which silently doubles a file.
+        """
+        try:
+            import hid  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise BridgeError("H7-TOOL USB HID support needs hidapi: & $py -m pip install -r .\\mcp\\requirements.txt") from exc
+        unit_id = int(self.config.get("unit_id", 1))
+        body = struct.pack(">BBHIII", unit_id, 0x64, func, total, offset, len(payload)) + payload
+        frame = body + crc16_modbus(body).to_bytes(2, "little")
+        item = self._find_interface()
+        budget = timeout_ms or max(3000, int(self.config.get("timeout_ms", 1000)))
+        dev = hid.device()
+        try:
+            dev.open_path(item["path"])
+            for _ in range(64):
+                if not dev.read(1024, 15):
+                    break
+            dev.write(b"\0" + frame + b"\0" * (1025 - 1 - len(frame)))
+            deadline = time.monotonic() + budget / 1000
+            while time.monotonic() < deadline:
+                reply = bytes(dev.read(1024, 200)).rstrip(b"\0")
+                if len(reply) < 7 or reply[0] != unit_id or reply[1] != 0x64:
+                    continue
+                if struct.unpack(">H", reply[2:4])[0] != func:
+                    continue
+                return reply
+        except BridgeError:
+            raise
+        except Exception as exc:
+            raise BridgeError(f"H7-TOOL file request failed: {exc}") from exc
+        finally:
+            try:
+                dev.close()
+            except Exception:
+                pass
+        raise BridgeError("no matching H7-TOOL file reply; close the vendor PC application and retry")
+
+    def native_list(self, directory: str) -> list[dict[str, Any]]:
+        """List a directory. Lines look like F<hex size>|<date> <time>|<name>."""
+        head = directory.rstrip("/").encode("gbk") + b"\0"
+        padding = b"\0" * max(0, 1000 - len(head))
+        reply = self._native_exchange(self.NATIVE_LIST_FILE, 0, 0, head + padding, 6000)
+        total = struct.unpack(">I", reply[5:9])[0]
+        pkg = struct.unpack(">I", reply[13:17])[0]
+        data = bytearray(reply[17:17 + min(pkg, total)]) if total else bytearray()
+        while len(data) < total:
+            reply = self._native_exchange(self.NATIVE_LIST_FILE, total, len(data), head + padding, 6000)
+            pkg = struct.unpack(">I", reply[13:17])[0]
+            piece = reply[17:17 + pkg]
+            if not piece:
+                break
+            data += piece
+        entries: list[dict[str, Any]] = []
+        for line in data.decode("gbk", "replace").splitlines():
+            line = line.strip()
+            if not line or "|" not in line:
+                continue
+            kind, rest = line[0], line[1:]
+            parts = rest.split("|")
+            if len(parts) < 3:
+                continue
+            try:
+                size = int(parts[0].strip(), 16)
+            except ValueError:
+                size = None
+            entries.append({
+                "name": parts[2].strip(),
+                "directory": kind.upper() == "D",
+                "size": size,
+                "stamp": parts[1].strip(),
+            })
+        return entries
+
+    def native_md5(self, path: str) -> tuple[int, str]:
+        reply = self._native_exchange(self.NATIVE_GET_FILE_MD5, 0, 0, path.encode("gbk"), 6000)
+        return struct.unpack(">I", reply[5:9])[0], reply[9:25].hex()
+
+    def native_delete(self, path: str) -> int:
+        reply = self._native_exchange(self.NATIVE_DEL_FILE, 0, 0, path.encode("gbk"), 6000)
+        return reply[4]
+
+    def native_mkdir(self, path: str) -> int:
+        reply = self._native_exchange(self.NATIVE_CREATE_FOLDER, 0, 0, path.encode("gbk"), 6000)
+        return reply[4]
+
+    def native_read(self, path: str, chunk: int = 1000) -> bytes:
+        payload = path.encode("gbk") + b"\0"
+        reply = self._native_exchange(self.NATIVE_READ_FILE, 0, 0, payload, 8000)
+        total = struct.unpack(">I", reply[5:9])[0]
+        got = struct.unpack(">I", reply[13:17])[0]
+        data = bytearray(reply[17:17 + got])
+        while len(data) < total:
+            reply = self._native_exchange(self.NATIVE_READ_FILE, total, len(data), payload, 8000)
+            got = struct.unpack(">I", reply[13:17])[0]
+            if got == 0:
+                break
+            data += reply[17:17 + got]
+        return bytes(data)
+
+    def native_write(self, path: str, content: bytes, progress=None) -> tuple[int, str]:
+        """First packet payload: size(4) | md5(16) | name_len(1) | full path | data."""
+        import hashlib as _hashlib
+        name = path.encode("gbk")
+        if len(name) > 255:
+            raise BridgeError("device path is too long for the name field")
+        total = len(content)
+        header = struct.pack(">I", total) + _hashlib.md5(content).digest() + bytes([len(name)]) + name
+        room = max(64, 1000 - len(header))
+        first = header + content[:room]
+        reply = self._native_exchange(self.NATIVE_WRITE_FILE, total, 0, first, 8000)
+        err = reply[4]
+        if err == 1:
+            return 1, "an identical file is already on the device, transfer skipped"
+        if err != 0:
+            return err, f"device reported error {err} on the first packet"
+        sent = len(first) - len(header)
+        packets = 1
+        while sent < total:
+            piece = content[sent:sent + 1000]
+            reply = self._native_exchange(self.NATIVE_WRITE_FILE, total, sent, piece, 8000)
+            packets += 1
+            if reply[4] != 0:
+                return reply[4], f"device reported error {reply[4]} at offset {sent}"
+            sent += len(piece)
+            if progress:
+                progress(sent, total)
+        return 0, f"wrote {total} bytes in {packets} packet(s)"
+
     def read_display(self, offset: int, length: int) -> bytes:
         """Read a slice of the tool's own LCD framebuffer.
 
@@ -4101,6 +4245,49 @@ class H7ToolMcp:
             payload["text"] = bytes(data).decode(content_encoding, errors="replace")
         return payload
 
+    def device_file_list(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """List a directory on the tool EMMC/SD over the native 0x64 protocol."""
+        self._require_hid_adapter("device_file_list")
+        path = str(arguments.get("path", "0:/H7-TOOL/Lua/My")).strip()
+        if not path:
+            raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My")
+        entries = self.hid_modbus.native_list(path)
+        return {"path": path, "count": len(entries), "entries": entries}
+
+    def device_file_delete(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Delete one file on the tool (native 0x64 sub-function 4)."""
+        self._require_hid_adapter("device_file_delete")
+        require_dangerous_confirmation(self.config, "write", str(arguments.get("confirmation", "")))
+        path = str(arguments.get("path", "")).strip()
+        if not path:
+            raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My/old.lua")
+        error = self.hid_modbus.native_delete(path)
+        return {"path": path, "error": error, "deleted": error == 0}
+
+    def device_file_mkdir(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Create a directory on the tool (native 0x64 sub-function 8)."""
+        self._require_hid_adapter("device_file_mkdir")
+        require_dangerous_confirmation(self.config, "write", str(arguments.get("confirmation", "")))
+        path = str(arguments.get("path", "")).strip()
+        if not path:
+            raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My/newdir")
+        error = self.hid_modbus.native_mkdir(path)
+        return {
+            "path": path,
+            "error": error,
+            "created": error == 0,
+            "already_existed": error == 1,
+        }
+
+    def device_file_md5(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """File size and MD5 on the tool (native 0x64 sub-function 3)."""
+        self._require_hid_adapter("device_file_md5")
+        path = str(arguments.get("path", "")).strip()
+        if not path:
+            raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My/app.lua")
+        size, digest = self.hid_modbus.native_md5(path)
+        return {"path": path, "size": size, "md5": digest}
+
     def screenshot(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Capture the tool's own LCD and write it next to the caller as a PNG."""
         self._require_hid_adapter("screenshot")
@@ -4262,10 +4449,81 @@ class H7ToolMcp:
             return self.device_file_read(arguments)
         if name == "screenshot":
             return self.screenshot(arguments)
+        if name == "device_file_list":
+            return self.device_file_list(arguments)
+        if name == "device_file_delete":
+            return self.device_file_delete(arguments)
+        if name == "device_file_mkdir":
+            return self.device_file_mkdir(arguments)
+        if name == "device_file_md5":
+            return self.device_file_md5(arguments)
         raise BridgeError(f"Unknown tool: {name}")
 
 
 TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "device_file_list",
+        "description": (
+            "List a directory on the H7-TOOL EMMC (0:/) or SD card (1:/) over function 0x64 "
+            "sub-function 2 - the native file channel, so the DAP/debug interface stays alive. "
+            "Each entry carries its real size and the FAT timestamp. The path must not end with a "
+            "slash. This is the only way to list files: the Lua API's f_dir crashes the firmware."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "default": "0:/H7-TOOL/Lua/My"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "device_file_delete",
+        "description": (
+            "Delete one file on the H7-TOOL (function 0x64 sub-function 4). The Lua file API cannot "
+            "do this: os.remove is a silent no-op there. Gated as a dangerous action at level write."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "for example 0:/H7-TOOL/Lua/My/old.lua"},
+                "confirmation": {"type": "string"},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "device_file_mkdir",
+        "description": (
+            "Create a directory on the H7-TOOL EMMC/SD (function 0x64 sub-function 8). error 0 means "
+            "created, 1 means it already existed. Gated as a dangerous action at level write."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "for example 0:/H7-TOOL/Lua/My/newdir"},
+                "confirmation": {"type": "string"},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "device_file_md5",
+        "description": (
+            "Read a file's size and MD5 from the H7-TOOL (function 0x64 sub-function 3). The digest "
+            "is the plain MD5 of the file, verified against hashlib on a real device."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
     {
         "name": "screenshot",
         "description": (
@@ -5198,7 +5456,8 @@ def self_test(_server: H7ToolMcp) -> int:
     assert DEVICE_FILE_PAGE_BYTES == 4096
     assert 1 <= DEVICE_FILE_MAX_READ <= 4096
     tool_names = {tool["name"] for tool in TOOLS}
-    assert {"device_file_write", "device_file_read", "screenshot"} <= tool_names
+    assert {"device_file_write", "device_file_read", "screenshot", "device_file_list",
+            "device_file_delete", "device_file_mkdir", "device_file_md5"} <= tool_names
     assert server._hid_lua_bytes(b"\x00\xff") == b"string.char(0,255)"
     assert server._device_path_bytes("0:/H7-TOOL/Lua/My/app.lua", "gbk") == b"0:/H7-TOOL/Lua/My/app.lua"
     assert server._device_path_bytes("0:/H7-TOOL/Lua/My/\u6a21\u62df.lua", "gbk") == (

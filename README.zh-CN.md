@@ -379,3 +379,28 @@ length + CRC** 六重匹配，因为管道里还混着 `01 61 ...` 这类无关�
 `device_file_write` 的分片以 **base64** 传输。Lua 长字符串本身能容纳 NUL 字节，但固件是把
 整个脚本当 **C 字符串**交给 `luaL_dostring()` 的，脚本里只要有一个 NUL 就被截断，之后每次
 写入都会静默失效。
+
+## EMMC 文件管理（原生通道）
+
+功能码 `0x64` 的 `func` 字段带了一整套文件管理指令（和下载 Lua 用的是同一帧），
+所以**列目录 / 删除 / 建目录都能在线做，DAP 调试口全程不断**。Lua 层做不到：
+`f_dir` 会让固件崩、`os.remove`/`os.rename` 是静默空操作。
+
+| func | 工具 | 说明 |
+|---|---|---|
+| 2 | `device_file_list` | 每行 `F<大小hex>\|<日期 时间>\|<文件名>`，`D` 表示目录 |
+| 3 | `device_file_md5` | 标准 MD5，已与 hashlib 逐字节核对 |
+| 4 | `device_file_delete` | 受 dangerous level `write` 门禁 |
+| 6 | 读文件 | 应答 `total(4) offset(4) bytes(4) 数据` |
+| 7 | 写文件 | 载荷 `大小(4) MD5(16) 名字长(1) 完整路径 数据` |
+| 8 | `device_file_mkdir` | 0 = 成功，1 = 已存在 |
+
+必须处理的固件怪癖：
+
+- 应答是 `func(2) result(1) total(4) offset(4) package_len(4) 数据`，**漏掉 result 字节**
+  会让后面每个字段错位一位；
+- `LIST` 和 `READ` **不会**给路径补 NUL（`DEL`/`MD5` 会 ✓）；
+- `LIST` 的路径**不能带尾部斜杠**，否则返回空清单；
+- `LIST` 把请求的 `package_len` 当成自己应答的长度，所以载荷要用 NUL 填充才能一次取一块；
+- 一帧**只能发一次**：重发 `WRITE_FILE` 会让固件把同样数据缓冲两遍，文件直接翻倍；
+- `DEL_DIR`（5）在固件里声明了但没实现。
