@@ -313,9 +313,38 @@ Good workflow:
 - `rtt_read`
 - `log_tail`
 - `read_memory`
+- `device_file_write`
+- `device_file_read`
 
 ## Notes
 
 Device scripts in the H7-TOOL package often describe whole chip families rather than one exact part number. For example, searching for `STM32H743` may return a generic STM32H7 profile. Use live target data, profile metadata, and chip-specific registers together when exact identification matters.
 
 Only one program should actively control the same H7-TOOL operation path at a time. If an AI call times out or returns an unexpected result, close conflicting operations in the PC tool and try again.
+
+
+### Reading and writing files on the H7-TOOL
+
+`device_file_write` and `device_file_read` move regular files to and from the tool's EMMC (`0:/`) or SD card (`1:/`).
+
+- Writing is gated as a dangerous action: set `"dangerous_actions": {"enabled": true, "allowed_levels": ["write"], ...}` in `config.json` and pass the matching `confirmation` phrase. Reads are never gated.
+- The tool's FAT stores Chinese file names as GBK, so `path_encoding` defaults to `gbk`. Pass `utf-8` if your tree is ASCII-only.
+- The Lua file API has no delete, truncate, or mkdir call. The target directory must already exist, and a rewrite shorter than the previous file leaves the old tail in place; `device_file_write` reports that in `warnings`. Delete the file with the H7-TOOL PC software and write again.
+- Writes larger than 16 KiB, and writes crossing a 4 KiB page, are both handled internally: one `f_write` call rejects a payload above 16 KiB, and the tool duplicates a single byte when one call crosses a 4096-byte page from an unaligned offset.
+- A Lua script itself is no longer limited to roughly 1000 bytes. Function `0x64` carries `(total length, offset, chunk length)`, so the bridge streams a large script across several 1024-byte HID reports.
+
+### When a Lua call returns no output
+
+The tool occasionally acknowledges a `function 0x64` (download/execute Lua) request and then neither runs the script nor prints anything, while `tool_status` and other register reads keep working. Press **C** on the H7-TOOL (or power-cycle it) to clear the wedged Lua session, then retry.
+
+The bridge already retries read-only and idempotent calls once, and `lua_draft_run` accepts `retry_on_empty: true` for a script that is safe to run twice.
+
+Relevant `adapter` settings:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `timeout_ms` | `20000` in the shipped examples | Whole window one Lua call may take |
+| `print_quiet_ms` | `500` | How long output may stay quiet before a script without markers counts as finished |
+| `lua_chunk_bytes` | `700` | HID report payload used to stream a script; must stay under 1000 |
+| `lua_chunk_delay_ms` | `4` | Pause between script chunks |
+| `drain_before_run_ms` | `150` | Print polling done before a run, so leftovers are not reported as its output |

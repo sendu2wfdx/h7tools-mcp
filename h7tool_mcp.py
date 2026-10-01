@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import hashlib
 import json
 import math
@@ -25,7 +26,17 @@ from typing import Any
 
 
 SERVER_NAME = "h7tool-mcp-assistant"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.4.0"
+# H7-TOOL function 0x64 carries three uint32 fields: total length, offset and the
+# length of this chunk.  A script may therefore span several 1024-byte HID
+# reports; sending it in one report used to cap a Lua script at about 1000 bytes.
+LUA_MAX_CHUNK_BYTES = 1000
+LUA_CHUNK_BYTES = 700
+# f_write() rejects a single payload larger than 16 KiB, and the tool duplicates
+# one byte when a write crosses a 4096-byte page from an unaligned start offset.
+# Writing whole pages from page-aligned offsets avoids both problems.
+DEVICE_FILE_PAGE_BYTES = 4096
+DEVICE_FILE_MAX_READ = 4096
 SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
 DEVICE_ROOT = Path(__file__).resolve().parent.parent / "EMMC" / "H7-TOOL" / "Programmer" / "Device"
@@ -1148,6 +1159,18 @@ def require_dangerous_confirmation(
     if confirmation != policy["confirmation_phrase"]:
         raise BridgeError("confirmation phrase did not match the configured dangerous action policy")
     return {"allowed": True, "level": level}
+
+
+def rolling_byte_hash(data: bytes) -> int:
+    """Position-weighted byte sum, mirrored by the Lua verification snippets.
+
+    It only has to detect a wrong write, so a cheap rolling sum beats the
+    tool's own STM32 CRC32 variant, which would need a matching implementation.
+    """
+    total = 0
+    for index, value in enumerate(data, start=1):
+        total = (total + value * index) % 4294967296
+    return total
 
 
 def _parse_hex_address(value: Any, label: str = "address") -> int:
@@ -2592,8 +2615,37 @@ class H7ToolHidModbusAdapter:
         self,
         script: bytes,
         script_label: str,
+        begin_marker: bytes | None = None,
+        end_marker: bytes | None = None,
+        retry_on_empty: int = 0,
+    ) -> dict[str, Any]:
+        """Run a Lua script, retrying when the tool answers but never prints.
+
+        The tool acknowledges function 0x64 before its Lua VM is ready, and
+        occasionally a run then returns that acknowledgement with no print output
+        at all; the next identical attempt normally works.  Read-only callers and
+        callers whose write is idempotent ask for a retry.  A script with side
+        effects must opt in, because a lost output cannot be told apart from a
+        script that ran and printed nothing.
+        """
+        attempts = 1 + max(0, int(retry_on_empty))
+        for attempt in range(attempts):
+            try:
+                return self._run_lua_script_once(script, script_label, begin_marker, end_marker, attempts > 1)
+            except BridgeError as exc:
+                silent = "produced no output" in str(exc) or "diagnostic output was incomplete" in str(exc)
+                if not silent or attempt == attempts - 1:
+                    raise
+                time.sleep(0.4)
+        raise BridgeError(f"Lua {script_label} did not run after {attempts} attempts")
+
+    def _run_lua_script_once(
+        self,
+        script: bytes,
+        script_label: str,
         begin_marker: bytes | None,
         end_marker: bytes | None,
+        fail_fast_on_silence: bool = False,
     ) -> dict[str, Any]:
         try:
             import hid  # type: ignore[import-not-found]
@@ -2604,36 +2656,69 @@ class H7ToolHidModbusAdapter:
             raise BridgeError(f"Lua script {script_label} failed its safety marker check")
         item = self._find_interface()
         timeout_ms = max(1000, int(self.config.get("timeout_ms", 8000)))
+        # How long the output may stay quiet before a non-marker script is treated
+        # as finished.  Too small a value truncates output; timeout_ms caps it.
+        quiet_s = max(0.05, float(self.config.get("print_quiet_ms", 500)) / 1000.0)
+        chunk_bytes = int(self.config.get("lua_chunk_bytes", LUA_CHUNK_BYTES))
+        chunk_bytes = max(64, min(chunk_bytes, LUA_MAX_CHUNK_BYTES))
+        chunk_delay_s = max(0.0, float(self.config.get("lua_chunk_delay_ms", 4)) / 1000.0)
+        drain_s = max(0.0, float(self.config.get("drain_before_run_ms", 150)) / 1000.0)
         payload = script + (b"" if script.endswith(b"\0") else b"\0")
-        request_body = struct.pack(">BBHIII", 1, 0x64, 0, len(payload), 0, len(payload)) + payload
-        request = request_body + crc16_modbus(request_body).to_bytes(2, "little")
+        total = len(payload)
         output = bytearray()
         ack_seen = False
+        ack_at = 0.0
         reports = 0
         last_output_at = 0.0
         dev = hid.device()
         try:
             dev.open_path(item["path"])
-            written = dev.write(self._report(request))
-            if written != 1025:
-                raise BridgeError("H7-TOOL HID write did not accept the Lua request")
+            channel = 0
+            # Discard print output left over from an earlier script so it cannot be
+            # reported as if this run produced it.
+            drain_until = time.monotonic() + drain_s
+            while time.monotonic() < drain_until:
+                dev.write(self._report(self._lua_poll_frame(channel)))
+                channel = (channel + 1) % 5
+                bytes(dev.read(1024, 20))
+                time.sleep(0.01)
+            # Send the script as (total, offset, chunk) reports.
+            offset = 0
+            while offset < total:
+                piece = payload[offset : offset + chunk_bytes]
+                request_body = struct.pack(">BBHIII", 1, 0x64, 0, total, offset, len(piece)) + piece
+                request = request_body + crc16_modbus(request_body).to_bytes(2, "little")
+                written = dev.write(self._report(request))
+                if written != 1025:
+                    raise BridgeError("H7-TOOL HID write did not accept the Lua request")
+                offset += len(piece)
+                if chunk_delay_s:
+                    time.sleep(chunk_delay_s)
             deadline = time.monotonic() + timeout_ms / 1000
             next_poll = 0.0
-            channel = 0
             while time.monotonic() < deadline:
                 now = time.monotonic()
                 if now >= next_poll:
                     dev.write(self._report(self._lua_poll_frame(channel)))
                     channel = (channel + 1) % 5
                     next_poll = now + 0.02
-                if not strict_markers and ack_seen and output and last_output_at and now - last_output_at > 0.35:
+                if not strict_markers and ack_seen and output and last_output_at and now - last_output_at > quiet_s:
                     break
+                # Every script this module generates prints its begin marker
+                # first, so sustained silence after the acknowledgement means the
+                # run was lost rather than slow.
+                if strict_markers and fail_fast_on_silence and ack_seen and not output and ack_at and now - ack_at > 2.0:
+                    raise BridgeError(
+                        f"Lua {script_label} produced no output; the H7-TOOL acknowledged the script but never ran it - "
+                        "press C on the H7-TOOL (or power-cycle it) to clear a wedged Lua session, then retry"
+                    )
                 report = bytes(dev.read(1024, 50))
                 if not report:
                     continue
                 reports += 1
                 if self._extract_lua_ack(report):
                     ack_seen = True
+                    ack_at = time.monotonic()
                     continue
                 text = self._extract_lua_print(report)
                 if text is not None:
@@ -2662,7 +2747,10 @@ class H7ToolHidModbusAdapter:
             begin_text = begin_marker.decode("ascii")
             end_text = end_marker.decode("ascii")
             if begin_text not in decoded or end_text not in decoded:
-                raise BridgeError(f"Lua was acknowledged but diagnostic output was incomplete: {decoded!r}")
+                raise BridgeError(
+                    "Lua was acknowledged but diagnostic output was incomplete: "
+                    f"{decoded!r}; press C on the H7-TOOL (or power-cycle it) to clear a wedged Lua session, then retry"
+                )
         return {
             "transport": "h7tool_hid/function_64_lua + function_61_print_poll",
             "script": script_label,
@@ -2677,7 +2765,7 @@ class H7ToolHidModbusAdapter:
             script = script_path.read_bytes()
         except OSError as exc:
             raise BridgeError(f"Cannot read bundled Lua script {script_name}: {exc}") from exc
-        return self._run_lua_script(script, f"diagnostics/{script_name}", begin_marker, end_marker)
+        return self._run_lua_script(script, f"diagnostics/{script_name}", begin_marker, end_marker, retry_on_empty=1)
 
     def run_health_script(self) -> dict[str, Any]:
         return self._run_fixed_lua_script("tool_health.lua", b"H7TOOL_DIAG_BEGIN", b"H7TOOL_DIAG_END")
@@ -3616,7 +3704,14 @@ class H7ToolMcp:
         has_user_markers = b"H7TOOL_USER_BEGIN" in script and b"H7TOOL_USER_END" in script
         begin_marker = b"H7TOOL_USER_BEGIN" if has_user_markers else None
         end_marker = b"H7TOOL_USER_END" if has_user_markers else None
-        result = self.hid_modbus._run_lua_script(script, f"workspace/lua_drafts/{path.name}", begin_marker, end_marker)
+        retry_on_empty = 1 if bool(arguments.get("retry_on_empty", False)) else 0
+        result = self.hid_modbus._run_lua_script(
+            script,
+            f"workspace/lua_drafts/{path.name}",
+            begin_marker,
+            end_marker,
+            retry_on_empty=retry_on_empty,
+        )
         result["review"] = review
         result["draft"] = {"name": path.name, "relative_path": f"workspace/lua_drafts/{path.name}"}
         result["output_contract"] = "structured_markers" if has_user_markers else "raw_output"
@@ -3658,6 +3753,236 @@ class H7ToolMcp:
             except BridgeError as exc:
                 sections["target_summary_error"] = str(exc)
         return diagnostic_report(arguments, self.config, sections)
+
+    def _require_hid_adapter(self, tool: str) -> None:
+        if self.adapter.kind != "h7tool_hid":
+            raise BridgeError(f"{tool} requires adapter.type = h7tool_hid")
+
+    def _hid_lua_bytes(self, data: bytes) -> bytes:
+        """Lua expression that rebuilds exact bytes (path or payload)."""
+        return ("string.char(" + ",".join(str(value) for value in data) + ")").encode("ascii")
+
+    def _device_path_bytes(self, path: str, encoding: str) -> bytes:
+        try:
+            raw = path.encode(encoding)
+        except (UnicodeEncodeError, LookupError) as exc:
+            raise BridgeError(f"cannot encode the device path with {encoding}: {exc}") from exc
+        if not (raw.startswith(b"0:/") or raw.startswith(b"1:/")):
+            raise BridgeError("device path must start with 0:/ (EMMC) or 1:/ (SD card)")
+        if b"\0" in raw or len(raw) > 200:
+            raise BridgeError("device path is not usable")
+        return raw
+
+    def device_file_write(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Write one file to the H7-TOOL EMMC and verify what landed there.
+
+        The tool has no truncate and no delete call, so a shorter rewrite leaves
+        the tail of a previously longer file in place; that case is reported.
+        """
+        self._require_hid_adapter("device_file_write")
+        require_dangerous_confirmation(self.config, "write", str(arguments.get("confirmation", "")))
+        path = str(arguments.get("path", "")).strip()
+        if not path:
+            raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My/app.lua")
+        path_encoding = str(arguments.get("path_encoding", "gbk"))
+        content_encoding = str(arguments.get("content_encoding", "utf-8"))
+        raw_base64 = arguments.get("content_base64")
+        if isinstance(raw_base64, str) and raw_base64.strip():
+            try:
+                content = base64.b64decode(raw_base64, validate=True)
+            except Exception as exc:  # base64 raises binascii.Error
+                raise BridgeError(f"content_base64 is not valid base64: {exc}") from exc
+        else:
+            text = arguments.get("content")
+            if not isinstance(text, str):
+                raise BridgeError("content or content_base64 is required")
+            try:
+                content = text.encode(content_encoding)
+            except (UnicodeEncodeError, LookupError) as exc:
+                raise BridgeError(f"cannot encode content with {content_encoding}: {exc}") from exc
+        if not content:
+            raise BridgeError("content is empty")
+        path_bytes = self._device_path_bytes(path, path_encoding)
+        page = max(256, min(int(self.config.get("device_file_piece_bytes", DEVICE_FILE_PAGE_BYTES)), DEVICE_FILE_PAGE_BYTES))
+        pieces = [content[index : index + page] for index in range(0, len(content), page)]
+        expected_hash = rolling_byte_hash(content)
+
+        script_parts = [
+            b'print("H7TOOL_FILE_BEGIN")',
+            b"local PATH = " + self._hid_lua_bytes(path_bytes),
+            b"local PIECES = {",
+        ]
+        for piece in pieces:
+            # The newline after [==[ is consumed by Lua, so the literal still
+            # holds the slice byte for byte when the slice starts with a newline.
+            script_parts.append(b"[==[\n" + piece + b"]==],")
+        script_parts.extend(
+            [
+                b"}",
+                b"local off = 0",
+                b"local failed = false",
+                b"for i = 1, #PIECES do",
+                b"  local ok, err = pcall(f_write, PATH, off, PIECES[i])",
+                b"  if not ok then",
+                b'    print(string.format("H7TOOL_FILE_ERROR i=%d off=%d err=%s", i, off, tostring(err)))',
+                b"    failed = true",
+                b"    break",
+                b"  end",
+                b"  off = off + #PIECES[i]",
+                b"end",
+                b"if not failed then",
+                b"  local ok, size = pcall(f_size, PATH)",
+                b"  if not ok then size = nil end",
+                b"  local sum, got, pos = 0, 0, 0",
+                b'  if type(size) == "number" then',
+                b"    while pos < size do",
+                b"      local want = 8000",
+                b"      if size - pos < want then want = size - pos end",
+                b"      local rok, n, back = pcall(f_read, PATH, pos, want)",
+                b'      if not rok or type(back) ~= "string" or #back == 0 then break end',
+                b"      for k = 1, #back do sum = (sum + string.byte(back, k) * (pos + k)) % 4294967296 end",
+                b"      got = got + #back",
+                b"      pos = pos + #back",
+                b"    end",
+                b"  end",
+                b'  print(string.format("H7TOOL_FILE_DONE wrote=%d size=%s read=%d hash=%d", off, tostring(size), got, sum))',
+                b"end",
+                b'print("H7TOOL_FILE_END")',
+            ]
+        )
+        script = b"\n".join(script_parts) + b"\n"
+        result = self.hid_modbus._run_lua_script(
+            script,
+            f"device_file_write {path}",
+            b"H7TOOL_FILE_BEGIN",
+            b"H7TOOL_FILE_END",
+            retry_on_empty=1,
+        )
+        text = result["result"]["raw"]
+        error_line = next((line.strip() for line in text.splitlines() if "H7TOOL_FILE_ERROR" in line), None)
+        if error_line is not None:
+            raise BridgeError(f"H7-TOOL rejected the file write: {error_line}")
+        done_line = next((line.strip() for line in text.splitlines() if "H7TOOL_FILE_DONE" in line), None)
+        if done_line is None:
+            raise BridgeError(f"the file write produced no result line: {text!r}")
+
+        fields: dict[str, str] = {}
+        for token in done_line.split()[1:]:
+            if "=" in token:
+                key, value = token.split("=", 1)
+                fields[key] = value
+
+        def as_int(key: str) -> int | None:
+            try:
+                return int(float(fields.get(key, "")))
+            except (TypeError, ValueError):
+                return None
+
+        wrote = as_int("wrote")
+        size = as_int("size")
+        read = as_int("read")
+        digest = as_int("hash")
+        warnings: list[str] = []
+        if size is not None and wrote is not None and size > wrote:
+            warnings.append(
+                "the device file is longer than the content written; the tool has no truncate call, "
+                "so an older longer version left a tail - delete it with the H7-TOOL PC software and write again"
+            )
+        verified = size == len(content) and read == len(content) and digest == expected_hash
+        if not verified:
+            warnings.append(
+                "read-back verification failed; do not trust this file. "
+                f"size={size} read={read} hash={digest} expected_size={len(content)} expected_hash={expected_hash}"
+            )
+        return {
+            "path": path,
+            "path_encoding": path_encoding,
+            "content_encoding": content_encoding,
+            "bytes_written": len(content),
+            "device_size": size,
+            "device_read": read,
+            "device_hash": digest,
+            "expected_hash": expected_hash,
+            "verified": verified,
+            "pieces": len(pieces),
+            "script_bytes": len(script),
+            "controller_reports": result["reports"],
+            "warnings": warnings,
+        }
+
+    def device_file_read(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Read a bounded window from one H7-TOOL EMMC/SD file."""
+        self._require_hid_adapter("device_file_read")
+        path = str(arguments.get("path", "")).strip()
+        if not path:
+            raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My/app.lua")
+        path_encoding = str(arguments.get("path_encoding", "gbk"))
+        content_encoding = str(arguments.get("content_encoding", "utf-8"))
+        offset = int(arguments.get("offset", 0))
+        length = int(arguments.get("length", 256))
+        if offset < 0:
+            raise BridgeError("offset must not be negative")
+        if not 1 <= length <= DEVICE_FILE_MAX_READ:
+            raise BridgeError(f"length must be between 1 and {DEVICE_FILE_MAX_READ}")
+        path_bytes = self._device_path_bytes(path, path_encoding)
+        # One 0x61 print frame carries roughly 1000 bytes, so emit 256-byte slices.
+        slice_bytes = 256
+        script_parts = [
+            b'print("H7TOOL_READ_BEGIN")',
+            b"local PATH = " + self._hid_lua_bytes(path_bytes),
+            b"local sok, size = pcall(f_size, PATH)",
+            b"if not sok then size = nil end",
+            b'print("H7TOOL_READ_SIZE " .. tostring(size))',
+            f"local pos, remaining = {offset}, {length}".encode("ascii"),
+            b"while remaining > 0 do",
+            f"  local want = {slice_bytes}".encode("ascii"),
+            b"  if remaining < want then want = remaining end",
+            b"  local ok, n, back = pcall(f_read, PATH, pos, want)",
+            b'  if not ok or type(back) ~= "string" or #back == 0 then break end',
+            b"  local out = {}",
+            b'  for i = 1, #back do out[#out + 1] = string.format("%02X", string.byte(back, i)) end',
+            b'  print("H7TOOL_READ_HEX " .. table.concat(out))',
+            b"  pos = pos + #back",
+            b"  remaining = remaining - #back",
+            b"end",
+            b'print("H7TOOL_READ_END")',
+        ]
+        script = b"\n".join(script_parts) + b"\n"
+        result = self.hid_modbus._run_lua_script(
+            script,
+            f"device_file_read {path}",
+            b"H7TOOL_READ_BEGIN",
+            b"H7TOOL_READ_END",
+            retry_on_empty=1,
+        )
+        text = result["result"]["raw"]
+        data = bytearray()
+        size: int | None = None
+        for line in text.splitlines():
+            line = line.replace("\x00", "").strip()
+            if line.startswith("H7TOOL_READ_SIZE "):
+                try:
+                    size = int(float(line.split(" ", 1)[1]))
+                except ValueError:
+                    size = None
+            elif line.startswith("H7TOOL_READ_HEX "):
+                try:
+                    data.extend(bytes.fromhex(line.split(" ", 1)[1]))
+                except ValueError:
+                    continue
+        output_format = str(arguments.get("format", "text"))
+        payload: dict[str, Any] = {
+            "path": path,
+            "path_encoding": path_encoding,
+            "device_size": size,
+            "offset": offset,
+            "bytes_read": len(data),
+            "format": output_format,
+            "hex": bytes(data).hex().upper(),
+        }
+        if output_format != "hex":
+            payload["text"] = bytes(data).decode(content_encoding, errors="replace")
+        return payload
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "bridge_status":
@@ -3776,6 +4101,10 @@ class H7ToolMcp:
             if self.adapter.kind == "h7tool_hid":
                 return self.read_hid_target_memory(address_int, length)
             return self.run_configured_command("read_memory", {"address": address, "length": length})
+        if name == "device_file_write":
+            return self.device_file_write(arguments)
+        if name == "device_file_read":
+            return self.device_file_read(arguments)
         raise BridgeError(f"Unknown tool: {name}")
 
 
@@ -3913,6 +4242,7 @@ TOOLS: list[dict[str, Any]] = [
                 "name": {"type": "string", "description": "Saved draft name under workspace/lua_drafts."},
                 "execute": {"type": "boolean", "description": "Must be true for every run."},
                 "confirmation": {"type": "string", "description": "Required only when review detects concrete dangerous levels allowed by dangerous_action_policy."},
+                "retry_on_empty": {"type": "boolean", "default": False, "description": "Retry once when the tool acknowledges the script but returns no output. Only set this when running the script twice is safe."},
             },
             "required": ["name", "execute"],
             "additionalProperties": False,
@@ -4243,6 +4573,44 @@ TOOLS: list[dict[str, Any]] = [
                 "length": {"type": "integer", "minimum": 1, "maximum": 1024},
             },
             "required": ["address", "length"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "device_file_write",
+        "description": (
+            "Write one file to the H7-TOOL EMMC/SD card and verify it by reading the result back. "
+            "Gated by dangerous_actions level 'write' in config.json. The tool has no delete or truncate call, "
+            "so directories must already exist and a shorter rewrite leaves an older longer file's tail in place."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute device path, for example 0:/H7-TOOL/Lua/My/app.lua"},
+                "content": {"type": "string", "description": "Text content. Do not combine with content_base64."},
+                "content_base64": {"type": "string", "description": "Binary content as base64. Takes precedence over content."},
+                "content_encoding": {"type": "string", "default": "utf-8", "description": "Encoding used to turn content into bytes."},
+                "path_encoding": {"type": "string", "default": "gbk", "description": "Encoding for the path. The tool FAT stores Chinese names as GBK."},
+                "confirmation": {"type": "string", "description": "Must match dangerous_actions.confirmation_phrase from config.json."},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "device_file_read",
+        "description": "Read a bounded window from one H7-TOOL EMMC/SD file, returning hex and optionally decoded text.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute device path, for example 0:/H7-TOOL/Lua/My/app.lua"},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "length": {"type": "integer", "minimum": 1, "maximum": 4096, "default": 256},
+                "path_encoding": {"type": "string", "default": "gbk"},
+                "content_encoding": {"type": "string", "default": "utf-8"},
+                "format": {"type": "string", "enum": ["text", "hex"], "default": "text"},
+            },
+            "required": ["path"],
             "additionalProperties": False,
         },
     },
@@ -4640,6 +5008,34 @@ def self_test(_server: H7ToolMcp) -> int:
         pass
     else:
         raise AssertionError("memory read limit was not enforced")
+    # EMMC file helpers and the chunked function-0x64 transfer.
+    assert rolling_byte_hash(b"") == 0
+    assert rolling_byte_hash(b"\x01\x02\x03") == 14
+    assert LUA_CHUNK_BYTES <= LUA_MAX_CHUNK_BYTES <= 1024 - 16 - 2
+    assert DEVICE_FILE_PAGE_BYTES == 4096
+    assert 1 <= DEVICE_FILE_MAX_READ <= 4096
+    tool_names = {tool["name"] for tool in TOOLS}
+    assert {"device_file_write", "device_file_read"} <= tool_names
+    assert server._hid_lua_bytes(b"\x00\xff") == b"string.char(0,255)"
+    assert server._device_path_bytes("0:/H7-TOOL/Lua/My/app.lua", "gbk") == b"0:/H7-TOOL/Lua/My/app.lua"
+    assert server._device_path_bytes("0:/H7-TOOL/Lua/My/\u6a21\u62df.lua", "gbk") == (
+        "0:/H7-TOOL/Lua/My/\u6a21\u62df.lua".encode("gbk")
+    )
+    for bad_path in ("app.lua", "2:/x.lua", ""):
+        try:
+            server._device_path_bytes(bad_path, "gbk")
+        except BridgeError:
+            pass
+        else:
+            raise AssertionError(f"device path {bad_path!r} should have been rejected")
+    for tool in ("device_file_write", "device_file_read"):
+        try:
+            server.call_tool(tool, {"path": "0:/x.lua"})
+        except BridgeError as exc:
+            assert "h7tool_hid" in str(exc), f"{tool} rejection should name the adapter: {exc}"
+        else:
+            raise AssertionError(f"{tool} should refuse a non-HID adapter")
+    assert not hasattr(server, "_run_lua_script"), "the Lua runner belongs to the HID adapter"
     print("Self-test passed: MCP bridge is running in safe mock mode.")
     return 0
 

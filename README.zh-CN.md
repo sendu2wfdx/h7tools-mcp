@@ -323,9 +323,38 @@ AI 编写 Lua 辅助脚本的规则见：[AI 编写 H7-TOOL Lua 辅助脚本规�
 - `rtt_read`
 - `log_tail`
 - `read_memory`
+- `device_file_write`
+- `device_file_read`
 
 ## 说明
 
 H7-TOOL 设备库里的 Lua 脚本经常描述一整个芯片系列，而不是单个精确型号。例如搜索 `STM32H743` 可能会返回通用 STM32H7 profile。需要精确判断型号时，建议结合实机探测结果、profile 元数据和芯片特定寄存器一起判断。
 
 同一时间最好只让一个程序控制同一个 H7-TOOL 操作通道。如果 AI 调用超时或结果异常，先关闭 PC 工具中可能冲突的操作，再重新尝试。
+
+
+### 在 H7-TOOL 上读写文件
+
+`device_file_write` 和 `device_file_read` 用于向设备的 EMMC（`0:/`）或 SD 卡（`1:/`）传输普通文件。
+
+- 写入属于危险动作，会受门禁控制：在 `config.json` 里设置 `"dangerous_actions": {"enabled": true, "allowed_levels": ["write"], ...}`，并传入与之匹配的 `confirmation` 确认词。读取不受门禁限制。
+- 设备 FAT 以 GBK 存储中文文件名，因此 `path_encoding` 默认为 `gbk`；纯 ASCII 目录可传 `utf-8`。
+- Lua 文件接口没有删除、截断、建目录的函数：目标目录必须已存在，且重写比原文件短的内容会保留旧的尾巴；`device_file_write` 会在 `warnings` 里报告这种情况，请用 PC 软件删除该文件后重新写入。
+- 超过 16 KiB 的写入、以及跨 4 KiB 页的写入都已在内部处理：单次 `f_write` 不接受大于 16 KiB 的数据，而从非对齐偏移跨越 4096 字节页时设备会重复一个字节。
+- Lua 脚本本身不再限于约 1000 字节：功能码 `0x64` 的三个字段是（总长度, 偏移, 本块长度），桥接会把大脚本分报文传输。
+
+### Lua 调用返回空输出时
+
+设备偶尔会对 `0x64`（下载并执行 Lua）请求回 ack，但既不执行脚本也不打印任何东西，而此时 `tool_status` 等寄存器读取仍然正常。在 H7-TOOL 上按一次 **C**（或重新上电）即可清除卡住的 Lua 会话，然后重试。
+
+桥接已经会对只读和幂等的调用自动重试一次；`lua_draft_run` 也接受 `retry_on_empty: true`，适用于重复执行安全的脚本。
+
+`adapter` 里相关的配置：
+
+| 键 | 默认值 | 含义 |
+|---|---|---|
+| `timeout_ms` | 示例配置为 `20000` | 单次 Lua 调用的总时间窗口 |
+| `print_quiet_ms` | `500` | 无标记脚本的输出静默多久后视为结束 |
+| `lua_chunk_bytes` | `700` | 传输脚本时的 HID 报文负载，不得超过 1000 |
+| `lua_chunk_delay_ms` | `4` | 脚本分块之间的间隔 |
+| `drain_before_run_ms` | `150` | 运行前先消耗旧的打印输出，避免被当成本次结果 |
