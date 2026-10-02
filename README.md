@@ -432,15 +432,21 @@ the subnet mask.
 
 | Feature | Wireless (UDP) |
 |---|---|
-| Holding-register reads (`tool_registers`) | yes |
+| Holding-register reads (`tool_registers`) | yes - 512-register sweep, no lost replies |
 | `device_file_list` / `device_file_md5` | yes |
 | `device_file_mkdir` / `device_file_delete` | yes |
 | `device_file_read` / `device_file_write` | yes (verified byte-exact against the device's own MD5) |
 | Lua download / run (`lua_draft_run`, scripted runs) | yes - same 0x64 channel |
-| `screenshot` (0x66 display read) | **no** - timed out for six different framings; HID only |
-| `uart_transact` / `can_transact` / `i2c_transact` / `spi_transact` / `rtt_read` | no - HID only |
+| `screenshot` (0x66 display read) | yes - but the length field must be **u32**; a 16-bit length is silently ignored (this looked like "HID only" at first) |
+| Lua download + run + print channel (`0x64` func 0, `0x61` poll) | **yes** - verified: a script's `print` came back over UDP, so the script-driven tools (uart/can/i2c/spi/rtt) can be moved to wireless as well |
 
 ### Transport facts worth knowing
+
+**Every wireless request needs the session poll first.** V2.33 expects five `0x61` channel
+poll frames before the real request; without them only requests that happen to arrive while
+a session from an earlier call is still alive get answered. `session_poll` (default true)
+in the adapter config controls this. This is what made the display read look "HID only" -
+with the poll in place the full 240x320 framebuffer reads back over UDP in 153 slices.
 
 * **Only UDP works.** The tool opens no TCP listener (8080/502 refuse connections) and
   speaks standard **Modbus RTU over UDP on port 30010**, with the usual low-byte-first
@@ -459,6 +465,15 @@ the subnet mask.
 
 ### Register note
 
-`read_holding_registers` on the wireless adapter is reliable for a handful of registers.
-Repeated reads in a tight loop (tens to hundreds) will hang or lose replies - read a few
-and leave a gap, or use the USB path when you need to sweep a range.
+Sweeping works over UDP too: 512 consecutive single-register reads finished in about 11 s
+with **zero** lost replies, as long as each request is preceded by the session poll (the
+adapter does that automatically). Earlier "bulk reads hang" observations were caused by the
+tool being asleep, or by a request sent without opening the session - not by the transport.
+
+### Wireless frame details (verified on APP V2.33)
+
+* `0x66` display read: `unit | 0x66 | 0x0100:u16 | offset:u32 | length:**u32** | crc16le`.
+  The length is 32-bit. With a 16-bit length the tool ignores the request, which makes it
+  look like the feature is not available on this transport - it is.
+* `0x64` func 0 (Lua download/run) and `0x61` (print poll) answer over UDP as well, so the
+  script-driven debugging helpers are not limited to USB.

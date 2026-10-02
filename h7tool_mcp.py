@@ -27,7 +27,7 @@ from typing import Any
 
 
 SERVER_NAME = "h7tool-mcp-assistant"
-SERVER_VERSION = "0.9.0"
+SERVER_VERSION = "0.9.1"
 # H7-TOOL function 0x64 carries three uint32 fields: total length, offset and the
 # length of this chunk.  A script may therefore span several 1024-byte HID
 # reports; sending it in one report used to cap a Lua script at about 1000 bytes.
@@ -2313,6 +2313,9 @@ class ModbusUdpAdapter:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
                 client.settimeout(budget)
+                if bool(self.config.get("session_poll", True)):
+                    for index in range(5):
+                        client.sendto(self._session_poll_frame(index), (host, port))
                 client.sendto(frame, (host, port))
                 deadline = time.monotonic() + budget
                 while time.monotonic() < deadline:
@@ -2331,6 +2334,45 @@ class ModbusUdpAdapter:
         except Exception as exc:                                  # noqa: BLE001
             raise BridgeError(f"H7-TOOL wireless file request failed: {exc}") from exc
         raise BridgeError(f"H7-TOOL wireless file request timed out (func {func})")
+
+    def read_display_memory(self, offset: int, length: int) -> bytes:
+        """Read a slice of the tool's LCD framebuffer over the wireless link.
+
+        Frame: unit | 0x66 | 0x0100(u16) | offset(u32) | length(u32) | crc.
+        The length field is 32-bit here; sending it as 16-bit is silently ignored.
+        """
+        host = self.config.get("host")
+        port = self.config.get("port", 30010)
+        if not isinstance(host, str) or not isinstance(port, int):
+            raise BridgeError("modbus_udp adapter requires adapter.host and integer adapter.port")
+        unit_id = int(self.config.get("unit_id", 1))
+        body = struct.pack(">BBHII", unit_id, 0x66, 0x0100, offset, length)
+        frame = body + crc16_modbus(body).to_bytes(2, "little")
+        budget = max(0.5, int(self.config.get("timeout_ms", 1000)) / 1000)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+                client.settimeout(budget)
+                # V2.33 opens a UDP session with five channel poll frames; without them the
+                # tool answers only while a session from another request is still alive.
+                if bool(self.config.get("session_poll", True)):
+                    for index in range(5):
+                        client.sendto(self._session_poll_frame(index), (host, port))
+                client.sendto(frame, (host, port))
+                deadline = time.monotonic() + budget
+                while time.monotonic() < deadline:
+                    client.settimeout(max(0.05, deadline - time.monotonic()))
+                    try:
+                        reply, _peer = client.recvfrom(4096)
+                    except socket.timeout:
+                        break
+                    if len(reply) < 15 or reply[0] != unit_id or reply[1] != 0x66:
+                        continue
+                    return reply[13:13 + length]      # reply also carries the 2-byte CRC
+        except BridgeError:
+            raise
+        except Exception as exc:                                  # noqa: BLE001
+            raise BridgeError(f"H7-TOOL wireless display read failed: {exc}") from exc
+        return b""
 
     @staticmethod
     def _session_poll_frame(index: int) -> bytes:
@@ -2929,6 +2971,9 @@ class H7ToolHidModbusAdapter:
             import hid  # type: ignore[import-not-found]
         except ImportError as exc:
             raise BridgeError("H7-TOOL USB HID support needs hidapi: & $py -m pip install -r .\\mcp\\requirements.txt") from exc
+        if self.adapter.kind == "modbus_udp":
+            # wireless: same 0x66 framing, one datagram per slice
+            return self.modbus_udp.read_display_memory(offset, length)
         item = self._find_interface()
         timeout_ms = max(200, int(self.config.get("timeout_ms", 1000)))
         unit_id = int(self.config.get("unit_id", 1))
@@ -4319,7 +4364,6 @@ class H7ToolMcp:
 
     def screenshot(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Capture the tool's own LCD and write it next to the caller as a PNG."""
-        self._require_hid_adapter("screenshot")
         width = int(arguments.get("width", 240))
         height = int(arguments.get("height", 320))
         if not 1 <= width <= 480 or not 1 <= height <= 480:
