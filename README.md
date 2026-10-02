@@ -403,3 +403,62 @@ Firmware quirks the client must handle:
 - a request may only be written once: re-sending a `WRITE_FILE` packet buffers the same
   bytes twice and doubles the file;
 - `DEL_DIR` (5) is declared but unimplemented in the firmware.
+
+## Wireless (LAN) mode
+
+The H7-TOOL does not have to be on USB. Everything the file tools need also works over the
+tool's legacy UDP transport, so the MCP can drive it purely over the network.
+
+Copy `config.wireless.json` over `config.json` (or point the server at it) and set your
+tool's address:
+
+```json
+{
+  "adapter": {
+    "type": "modbus_udp",
+    "host": "192.168.1.13",
+    "port": 30010,
+    "unit_id": 1,
+    "timeout_ms": 8000
+  }
+}
+```
+
+The tool's IP can be read from its own registers without any connection: `0x1102`/`0x1103`
+hold the local IP (`192.168` / `1.13`), `0x1104`/`0x1105` the gateway, `0x1106`/`0x1107`
+the subnet mask.
+
+### What works over the wireless link
+
+| Feature | Wireless (UDP) |
+|---|---|
+| Holding-register reads (`tool_registers`) | yes |
+| `device_file_list` / `device_file_md5` | yes |
+| `device_file_mkdir` / `device_file_delete` | yes |
+| `device_file_read` / `device_file_write` | yes (verified byte-exact against the device's own MD5) |
+| Lua download / run (`lua_draft_run`, scripted runs) | yes - same 0x64 channel |
+| `screenshot` (0x66 display read) | **no** - timed out for six different framings; HID only |
+| `uart_transact` / `can_transact` / `i2c_transact` / `spi_transact` / `rtt_read` | no - HID only |
+
+### Transport facts worth knowing
+
+* **Only UDP works.** The tool opens no TCP listener (8080/502 refuse connections) and
+  speaks standard **Modbus RTU over UDP on port 30010**, with the usual low-byte-first
+  CRC16. Frames sent without a CRC simply time out.
+* **The whole custom 0x64 file API runs on this transport**, including writes. It is the
+  same frame layout as the USB path; only the wrapping differs.
+* `0x64` **func 5 (delete directory) is not implemented** - it answers `0xFF` (invalid
+  function). To delete a directory, use **func 4 (DEL_FILE)**, which removes empty
+  directories as well as files.
+* **Paths must be NUL-terminated.** The firmware does not terminate them itself: without
+  the NUL it reads past the string and creates entries whose names have trailing garbage
+  from the buffer - and those can then no longer be found by their intended name. This bit
+  the file tools until `_native_path()` was introduced.
+* `device_file_read` may return 0 bytes immediately after a write (the FAT entry has not
+  flushed yet). The tool retries; direct users of the protocol should do the same.
+
+### Register note
+
+`read_holding_registers` on the wireless adapter is reliable for a handful of registers.
+Repeated reads in a tight loop (tens to hundreds) will hang or lose replies - read a few
+and leave a gap, or use the USB path when you need to sweep a range.

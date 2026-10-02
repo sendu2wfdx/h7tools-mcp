@@ -27,7 +27,7 @@ from typing import Any
 
 
 SERVER_NAME = "h7tool-mcp-assistant"
-SERVER_VERSION = "0.8.4"
+SERVER_VERSION = "0.9.0"
 # H7-TOOL function 0x64 carries three uint32 fields: total length, offset and the
 # length of this chunk.  A script may therefore span several 1024-byte HID
 # reports; sending it in one report used to cap a Lua script at about 1000 bytes.
@@ -2225,6 +2225,8 @@ class ModbusTcpAdapter:
     config: dict[str, Any]
     transaction_id: int = 0
 
+    # ---- native 0x64 file management over the wireless link ----
+
     def read_holding_registers(self, address: int, count: int) -> list[int]:
         if not 0 <= address <= 0xFFFF or not 1 <= count <= 60:
             raise BridgeError("Modbus read address must be 0..65535 and count must be 1..60")
@@ -2292,6 +2294,43 @@ class ModbusUdpAdapter:
     """
 
     config: dict[str, Any]
+
+    def _udp_native_exchange(self, func: int, total: int, offset: int, payload: bytes,
+                             timeout_ms: int | None = None) -> bytes:
+        """One 0x64 exchange over Modbus-RTU/UDP (see _native_exchange in the HID adapter).
+
+        Same frame layout as the USB path; the UDP transport simply needs the RTU CRC and
+        a datagram socket. Frame layout and behaviour were verified on APP V2.33.
+        """
+        host = self.config.get("host")
+        port = self.config.get("port", 30010)
+        if not isinstance(host, str) or not isinstance(port, int):
+            raise BridgeError("modbus_udp adapter requires adapter.host and integer adapter.port")
+        unit_id = int(self.config.get("unit_id", 1))
+        body = struct.pack(">BBHIII", unit_id, 0x64, func, total, offset, len(payload)) + payload
+        frame = body + crc16_modbus(body).to_bytes(2, "little")
+        budget = max(0.5, (timeout_ms or max(3000, int(self.config.get("timeout_ms", 1000)))) / 1000)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+                client.settimeout(budget)
+                client.sendto(frame, (host, port))
+                deadline = time.monotonic() + budget
+                while time.monotonic() < deadline:
+                    client.settimeout(max(0.05, deadline - time.monotonic()))
+                    try:
+                        reply, _peer = client.recvfrom(4096)
+                    except socket.timeout:
+                        break
+                    if len(reply) < 7 or reply[0] != unit_id or reply[1] != 0x64:
+                        continue
+                    if struct.unpack(">H", reply[2:4])[0] != func:
+                        continue
+                    return reply
+        except BridgeError:
+            raise
+        except Exception as exc:                                  # noqa: BLE001
+            raise BridgeError(f"H7-TOOL wireless file request failed: {exc}") from exc
+        raise BridgeError(f"H7-TOOL wireless file request timed out (func {func})")
 
     @staticmethod
     def _session_poll_frame(index: int) -> bytes:
@@ -2757,16 +2796,27 @@ class H7ToolHidModbusAdapter:
             })
         return entries
 
+    @staticmethod
+    def _native_path(path: str, pad: int = 0) -> bytes:
+        """NUL-terminated path payload.
+
+        The firmware does not terminate the path itself: without a NUL it reads past the
+        string and stores whatever followed it in the buffer, creating entries whose name
+        has trailing garbage (and which then cannot be deleted by their intended name).
+        """
+        raw = path.encode("gbk") + b"\0"
+        return raw + b"\0" * (pad - len(raw)) if pad > len(raw) else raw
+
     def native_md5(self, path: str) -> tuple[int, str]:
-        reply = self._native_exchange(self.NATIVE_GET_FILE_MD5, 0, 0, path.encode("gbk"), 6000)
+        reply = self._native_exchange(self.NATIVE_GET_FILE_MD5, 0, 0, self._native_path(path), 6000)
         return struct.unpack(">I", reply[5:9])[0], reply[9:25].hex()
 
     def native_delete(self, path: str) -> int:
-        reply = self._native_exchange(self.NATIVE_DEL_FILE, 0, 0, path.encode("gbk"), 6000)
+        reply = self._native_exchange(self.NATIVE_DEL_FILE, 0, 0, self._native_path(path), 6000)
         return reply[4]
 
     def native_mkdir(self, path: str) -> int:
-        reply = self._native_exchange(self.NATIVE_CREATE_FOLDER, 0, 0, path.encode("gbk"), 6000)
+        reply = self._native_exchange(self.NATIVE_CREATE_FOLDER, 0, 0, self._native_path(path, 64), 6000)
         return reply[4]
 
     def native_read_window(self, path: str, offset: int, length: int) -> bytes:
@@ -4074,6 +4124,31 @@ class H7ToolMcp:
         """Lua expression that rebuilds exact bytes (path or payload)."""
         return ("string.char(" + ",".join(str(value) for value in data) + ")").encode("ascii")
 
+    FILE_NATIVE_METHODS = ("native_list", "native_md5", "native_delete", "native_mkdir",
+                           "native_read_window", "native_read", "native_write")
+
+    def _file_adapter(self):
+        """Native 0x64 file access works over USB HID and over the wireless UDP transport.
+
+        ModbusUdpAdapter reuses the HID adapter's file logic; only the transport differs,
+        so its _native_exchange is swapped for the UDP one here (bound once, lazily).
+        """
+        if self.adapter.kind == "modbus_udp":
+            if not getattr(ModbusUdpAdapter, "_native_bound", False):
+                ModbusUdpAdapter._native_path = staticmethod(H7ToolHidModbusAdapter._native_path)
+                for name in self.FILE_NATIVE_METHODS:
+                    setattr(ModbusUdpAdapter, name, getattr(H7ToolHidModbusAdapter, name))
+                for name in dir(H7ToolHidModbusAdapter):
+                    if name.startswith("NATIVE_"):          # sub-function constants
+                        setattr(ModbusUdpAdapter, name, getattr(H7ToolHidModbusAdapter, name))
+                ModbusUdpAdapter._native_exchange = ModbusUdpAdapter._udp_native_exchange
+                ModbusUdpAdapter._native_bound = True
+            return self.modbus_udp
+        if self.adapter.kind == "h7tool_hid":
+            return self.hid_modbus
+        raise BridgeError(
+            "device_file_* requires adapter.type = h7tool_hid (USB) or modbus_udp (wireless)")
+
     def _native_file_path(self, path: str, encoding: str) -> str:
         """Validate the device path and make sure it survives the GBK FAT."""
         raw = self._device_path_bytes(path, encoding)
@@ -4102,7 +4177,6 @@ class H7ToolMcp:
         The device verifies its own MD5 as well and skips the transfer entirely
         when identical content is already there.
         """
-        self._require_hid_adapter("device_file_write")
         require_dangerous_confirmation(self.config, "write", str(arguments.get("confirmation", "")))
         path = str(arguments.get("path", "")).strip()
         if not path:
@@ -4129,16 +4203,16 @@ class H7ToolMcp:
 
         import hashlib as _hashlib
         warnings: list[str] = []
-        previous = self.hid_modbus.native_md5(native_path)[0]
+        previous = self._file_adapter().native_md5(native_path)[0]
         if previous:
             # without this a shorter rewrite leaves the old tail behind
-            self.hid_modbus.native_delete(native_path)
-        error, detail = self.hid_modbus.native_write(native_path, content)
+            self._file_adapter().native_delete(native_path)
+        error, detail = self._file_adapter().native_write(native_path, content)
         if error not in (0, 1):
             raise BridgeError(f"H7-TOOL rejected the file write: {detail}")
         if error == 1:
             warnings.append("the device reported an identical file already present; the transfer was skipped")
-        size, digest = self.hid_modbus.native_md5(native_path)
+        size, digest = self._file_adapter().native_md5(native_path)
         expected = _hashlib.md5(content).hexdigest()
         verified = size == len(content) and digest == expected
         if not verified:
@@ -4167,7 +4241,6 @@ class H7ToolMcp:
         This path never touches the Lua VM, so it also works while a mini program
         is running on the tool.
         """
-        self._require_hid_adapter("device_file_read")
         path = str(arguments.get("path", "")).strip()
         if not path:
             raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My/app.lua")
@@ -4184,7 +4257,7 @@ class H7ToolMcp:
                 "into a watchdog reset. Read the file in 1024-byte windows instead."
             )
         native_path = self._native_file_path(path, path_encoding)
-        data = self.hid_modbus.native_read_window(native_path, offset, length)
+        data = self._file_adapter().native_read_window(native_path, offset, length)
         text: str | None = None
         encoding = arguments.get("content_encoding")
         if isinstance(encoding, str) and encoding:
@@ -4206,31 +4279,28 @@ class H7ToolMcp:
 
     def device_file_list(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """List a directory on the tool EMMC/SD over the native 0x64 protocol."""
-        self._require_hid_adapter("device_file_list")
         path = str(arguments.get("path", "0:/H7-TOOL/Lua/My")).strip()
         if not path:
             raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My")
-        entries = self.hid_modbus.native_list(path)
+        entries = self._file_adapter().native_list(path)
         return {"path": path, "count": len(entries), "entries": entries}
 
     def device_file_delete(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Delete one file on the tool (native 0x64 sub-function 4)."""
-        self._require_hid_adapter("device_file_delete")
         require_dangerous_confirmation(self.config, "write", str(arguments.get("confirmation", "")))
         path = str(arguments.get("path", "")).strip()
         if not path:
             raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My/old.lua")
-        error = self.hid_modbus.native_delete(path)
+        error = self._file_adapter().native_delete(path)
         return {"path": path, "error": error, "deleted": error == 0}
 
     def device_file_mkdir(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Create a directory on the tool (native 0x64 sub-function 8)."""
-        self._require_hid_adapter("device_file_mkdir")
         require_dangerous_confirmation(self.config, "write", str(arguments.get("confirmation", "")))
         path = str(arguments.get("path", "")).strip()
         if not path:
             raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My/newdir")
-        error = self.hid_modbus.native_mkdir(path)
+        error = self._file_adapter().native_mkdir(path)
         return {
             "path": path,
             "error": error,
@@ -4244,7 +4314,7 @@ class H7ToolMcp:
         path = str(arguments.get("path", "")).strip()
         if not path:
             raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My/app.lua")
-        size, digest = self.hid_modbus.native_md5(path)
+        size, digest = self._file_adapter().native_md5(path)
         return {"path": path, "size": size, "md5": digest}
 
     def screenshot(self, arguments: dict[str, Any]) -> dict[str, Any]:
