@@ -27,7 +27,7 @@ from typing import Any
 
 
 SERVER_NAME = "h7tool-mcp-assistant"
-SERVER_VERSION = "0.9.1"
+SERVER_VERSION = "0.9.2"
 # H7-TOOL function 0x64 carries three uint32 fields: total length, offset and the
 # length of this chunk.  A script may therefore span several 1024-byte HID
 # reports; sending it in one report used to cap a Lua script at about 1000 bytes.
@@ -2335,6 +2335,97 @@ class ModbusUdpAdapter:
             raise BridgeError(f"H7-TOOL wireless file request failed: {exc}") from exc
         raise BridgeError(f"H7-TOOL wireless file request timed out (func {func})")
 
+    def _lua_poll_raw(self, channel: int, timeout: float = 0.4) -> bytes:
+        """One 0x61 print-channel poll; returns the printable payload (CRC stripped)."""
+        host = self.config.get("host")
+        port = self.config.get("port", 30010)
+        unit_id = int(self.config.get("unit_id", 1))
+        body = bytes([1, 0x61, 0, channel % 5, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 0])
+        frame = body + crc16_modbus(body).to_bytes(2, "little")
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+            client.settimeout(timeout)
+            client.sendto(frame, (host, port))
+            try:
+                reply, _peer = client.recvfrom(8192)
+            except socket.timeout:
+                return b""
+        if len(reply) < 10 or reply[0] != unit_id or reply[1] != 0x61:
+            return b""
+        return reply[8:-2]                                   # header + CRC stripped
+
+    def _run_lua_script(self, script: bytes, script_label: str,
+                        begin_marker: bytes | None = None, end_marker: bytes | None = None,
+                        retry_on_empty: int = 0) -> dict:
+        """Same contract as the USB runner, over the wireless link."""
+        if begin_marker is not None and end_marker is not None:
+            if begin_marker not in script or end_marker not in script:
+                raise BridgeError(f"Lua script {script_label} failed its safety marker check")
+        attempts = 1 + max(0, int(retry_on_empty))
+        raw = b""
+        for attempt in range(attempts):
+            raw = self.run_lua_script(
+                script,
+                quiet_s=max(0.05, float(self.config.get("print_quiet_ms", 500)) / 1000.0))
+            if raw.strip(b"\0 \r\n\t"):
+                break
+            if attempt < attempts - 1:
+                time.sleep(0.4)
+        if not raw.strip(b"\0 \r\n\t"):
+            raise BridgeError(f"Lua {script_label} produced no output over the wireless link")
+        text = raw.decode("utf-8", "replace").replace("\0", "")
+        return {"output": [ln for ln in text.splitlines() if ln.strip()],
+                "raw": text, "transport": "modbus_udp"}
+
+    def _run_lua_script_once(self, script: bytes, script_label: str,
+                             begin_marker: bytes | None = None, end_marker: bytes | None = None,
+                             fail_fast_on_silence: bool = False) -> dict:
+        return self._run_lua_script(script, script_label, begin_marker, end_marker)
+
+    def run_lua_script(self, script: bytes, quiet_s: float = 0.6,
+                       total_timeout_s: float = 25.0) -> bytes:
+        """Upload and run a Lua script over the wireless link, returning its print output.
+
+        Mirrors the USB path: the script is NUL-terminated, sent as (total, offset, chunk)
+        0x64 func 0 requests, and the print channel is polled until it stays quiet.
+        """
+        host = self.config.get("host")
+        port = self.config.get("port", 30010)
+        if not isinstance(host, str) or not isinstance(port, int):
+            raise BridgeError("modbus_udp adapter requires adapter.host and integer adapter.port")
+        payload = script + (b"" if script.endswith(b"\0") else b"\0")
+        total = len(payload)
+        chunk = int(self.config.get("lua_chunk_bytes", 1000))
+        chunk = max(64, min(chunk, 1000))
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        output = bytearray()
+        try:
+            # drain stale prints so they cannot be mistaken for this run's output
+            for channel in range(5):
+                output += self._lua_poll_raw(channel, 0.25)
+            output.clear()
+            offset = 0
+            while offset < total:
+                piece = payload[offset:offset + chunk]
+                self._udp_native_exchange(0, total, offset, piece, timeout_ms=6000)   # func 0
+                offset += len(piece)
+                time.sleep(max(0.0, float(self.config.get("lua_chunk_delay_ms", 4)) / 1000.0))
+            deadline = time.monotonic() + total_timeout_s
+            last = time.monotonic()
+            channel = 0
+            while time.monotonic() < deadline:
+                data = self._lua_poll_raw(channel, 0.4)
+                channel = (channel + 1) % 5
+                if data:
+                    output += data
+                    last = time.monotonic()
+                elif output and time.monotonic() - last >= quiet_s:
+                    break
+                elif not output and time.monotonic() - last > max(3.0, quiet_s * 5):
+                    break
+            return bytes(output)
+        finally:
+            client.close()
+
     def read_display_memory(self, offset: int, length: int) -> bytes:
         """Read a slice of the tool's LCD framebuffer over the wireless link.
 
@@ -3054,10 +3145,6 @@ class H7ToolHidModbusAdapter:
         end_marker: bytes | None,
         fail_fast_on_silence: bool = False,
     ) -> dict[str, Any]:
-        try:
-            import hid  # type: ignore[import-not-found]
-        except ImportError as exc:
-            raise BridgeError("H7-TOOL USB HID support needs hidapi: & $py -m pip install -r .\\mcp\\requirements.txt") from exc
         strict_markers = begin_marker is not None and end_marker is not None
         if strict_markers and (begin_marker not in script or end_marker not in script):
             raise BridgeError(f"Lua script {script_label} failed its safety marker check")
@@ -3655,13 +3742,13 @@ class H7ToolMcp:
         return LegacyH7ToolLuaSerialAdapter(self.config["adapter"]).run_health_script()
 
     def read_hid_lua_health(self) -> dict[str, Any]:
-        return self.hid_modbus.run_health_script()
+        return self._script_adapter().run_health_script()
 
     def read_hid_target_probe(self) -> dict[str, Any]:
-        return self.hid_modbus.run_target_probe_script()
+        return self._script_adapter().run_target_probe_script()
 
     def read_hid_target_memory(self, address: int, length: int) -> dict[str, Any]:
-        return self.hid_modbus.run_read_memory_script(address, length)
+        return self._script_adapter().run_read_memory_script(address, length)
 
     def uart_transact(self, arguments: dict[str, Any]) -> dict[str, Any]:
         channel = int(arguments.get("channel", 1))
@@ -3697,9 +3784,7 @@ class H7ToolMcp:
             tx_data = b""
         if len(tx_data) > 512:
             raise BridgeError("UART send payload is limited to 512 bytes")
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("uart_transact currently requires adapter.type = h7tool_hid")
-        return self.hid_modbus.run_uart_transact_script(
+        return self._script_adapter().run_uart_transact_script(
             channel=channel,
             baudrate=baudrate,
             parity=parity,
@@ -3754,9 +3839,7 @@ class H7ToolMcp:
         max_data_len = 64 if mode == 2 else 8
         if len(tx_data) > max_data_len:
             raise BridgeError(f"CAN data payload is limited to {max_data_len} bytes for this mode")
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("can_transact currently requires adapter.type = h7tool_hid")
-        return self.hid_modbus.run_can_transact_script(
+        return self._script_adapter().run_can_transact_script(
             mode=mode,
             fifo_len=fifo_len,
             bitrate=bitrate,
@@ -3798,7 +3881,7 @@ class H7ToolMcp:
             raise BridgeError("I2C write payload is limited to 256 bytes")
         if self.adapter.kind != "h7tool_hid":
             raise BridgeError("i2c_transact currently requires adapter.type = h7tool_hid")
-        return self.hid_modbus.run_i2c_transact_script(
+        return self._script_adapter().run_i2c_transact_script(
             clock_hz=clock_hz,
             scan=scan,
             address=address,
@@ -3837,9 +3920,7 @@ class H7ToolMcp:
             write_data = b""
         if len(write_data) > 256:
             raise BridgeError("SPI write payload is limited to 256 bytes")
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("spi_transact currently requires adapter.type = h7tool_hid")
-        return self.hid_modbus.run_spi_transact_script(
+        return self._script_adapter().run_spi_transact_script(
             freq_id=freq_id,
             phase=phase,
             polarity=polarity,
@@ -3890,9 +3971,7 @@ class H7ToolMcp:
             raise BridgeError("No RTT address or search ranges are available")
         if len(ranges) > 16:
             raise BridgeError("Refusing to scan more than 16 RTT ranges")
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("rtt_read currently requires adapter.type = h7tool_hid")
-        return self.hid_modbus.run_rtt_read_script(
+        return self._script_adapter().run_rtt_read_script(
             control_block_address=control_block_address,
             ranges=ranges,
             channel=channel,
@@ -3901,8 +3980,6 @@ class H7ToolMcp:
         )
 
     def read_option_bytes(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("read_option_bytes currently requires adapter.type = h7tool_hid")
         profile = read_selected_target_profile(self.config, arguments)
         address_texts = profile.get("option_byte_addresses", [])
         if not isinstance(address_texts, list) or not address_texts:
@@ -3912,7 +3989,7 @@ class H7ToolMcp:
             if not isinstance(item, str):
                 continue
             addresses.append(int(item, 16))
-        result = self.hid_modbus.run_read_option_bytes_script(addresses)
+        result = self._script_adapter().run_read_option_bytes_script(addresses)
         result["profile"] = {
             "relative_path": profile.get("relative_path"),
             "vendor": profile.get("vendor"),
@@ -3922,8 +3999,6 @@ class H7ToolMcp:
         return result
 
     def protection_status(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("protection_status currently requires adapter.type = h7tool_hid")
         profile = read_selected_target_profile(self.config, arguments)
         checks = profile.get("protection_checks", [])
         if not isinstance(checks, list) or not checks:
@@ -3932,7 +4007,7 @@ class H7ToolMcp:
         for check in checks:
             if isinstance(check, dict) and isinstance(check.get("address"), str):
                 addresses.append(int(check["address"], 16))
-        read_result = self.hid_modbus.run_read_option_bytes_script(addresses)
+        read_result = self._script_adapter().run_read_option_bytes_script(addresses)
         entries = read_result["result"]["data"].get("entries", [])
         values_by_address = {
             entry["address"].upper(): int(str(entry["value"]), 16)
@@ -3981,8 +4056,6 @@ class H7ToolMcp:
         }
 
     def target_identity(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("target_identity currently requires adapter.type = h7tool_hid")
         profile = read_selected_target_profile(self.config, arguments)
         probe = self.read_hid_target_probe()
         probe_data = probe["result"]["data"]
@@ -4062,8 +4135,6 @@ class H7ToolMcp:
         return result
 
     def target_flash_info(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("target_flash_info currently requires adapter.type = h7tool_hid")
         profile = read_selected_target_profile(self.config, arguments)
         address_text = arguments.get("address")
         if isinstance(address_text, str) and address_text.strip():
@@ -4089,8 +4160,6 @@ class H7ToolMcp:
         confirmation = str(arguments.get("confirmation", ""))
         if not execute:
             raise BridgeError("lua_draft_run requires execute=true")
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("lua_draft_run requires adapter.type = h7tool_hid")
         path = _lua_draft_path(name)
         if not path.exists():
             raise BridgeError(f"Lua draft not found: {path.name}")
@@ -4112,7 +4181,7 @@ class H7ToolMcp:
         begin_marker = b"H7TOOL_USER_BEGIN" if has_user_markers else None
         end_marker = b"H7TOOL_USER_END" if has_user_markers else None
         retry_on_empty = 1 if bool(arguments.get("retry_on_empty", False)) else 0
-        result = self.hid_modbus._run_lua_script(
+        result = self._script_adapter()._run_lua_script(
             script,
             f"workspace/lua_drafts/{path.name}",
             begin_marker,
@@ -4171,6 +4240,23 @@ class H7ToolMcp:
 
     FILE_NATIVE_METHODS = ("native_list", "native_md5", "native_delete", "native_mkdir",
                            "native_read_window", "native_read", "native_write")
+
+    SCRIPT_WRAPPERS = tuple(
+        n for n in dir(H7ToolHidModbusAdapter)
+        if n.endswith("_script") and not n.startswith("__"))
+
+    def _script_adapter(self):
+        """Script-driven tools run the same Lua over USB or over the wireless link."""
+        if self.adapter.kind == "modbus_udp":
+            for name in self.SCRIPT_WRAPPERS + ("_run_lua_script", "_run_lua_script_once"):
+                if hasattr(ModbusUdpAdapter, name):
+                    continue
+                setattr(ModbusUdpAdapter, name, getattr(H7ToolHidModbusAdapter, name))
+            return self.modbus_udp
+        if self.adapter.kind == "h7tool_hid":
+            return self.hid_modbus
+        raise BridgeError(
+            "script-driven tools require adapter.type = h7tool_hid (USB) or modbus_udp (wireless)")
 
     def _file_adapter(self):
         """Native 0x64 file access works over USB HID and over the wireless UDP transport.
@@ -4459,8 +4545,6 @@ class H7ToolMcp:
         if name == "health_summary":
             return self.health_summary()
         if name == "lua_health":
-            if self.adapter.kind != "h7tool_hid":
-                raise BridgeError("lua_health requires adapter.type = h7tool_hid")
             return self.read_hid_lua_health()
         if name == "tool_registers":
             if self.adapter.kind not in {"modbus_tcp", "modbus_udp", "h7tool_hid"}:

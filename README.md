@@ -438,7 +438,8 @@ the subnet mask.
 | `device_file_read` / `device_file_write` | yes (verified byte-exact against the device's own MD5) |
 | Lua download / run (`lua_draft_run`, scripted runs) | yes - same 0x64 channel |
 | `screenshot` (0x66 display read) | yes - but the length field must be **u32**; a 16-bit length is silently ignored (this looked like "HID only" at first) |
-| Lua download + run + print channel (`0x64` func 0, `0x61` poll) | **yes** - verified: a script's `print` came back over UDP, so the script-driven tools (uart/can/i2c/spi/rtt) can be moved to wireless as well |
+| Lua download + run + print channel (`0x64` func 0, `0x61` poll) | **yes** - verified: a script's `print` came back over UDP |
+| Script-driven tools (`uart_transact`, `can_transact`, `i2c_transact`, `spi_transact`, `rtt_read`, `health_summary`, target/protection helpers) | **yes** - `_script_adapter()` routes them through `ModbusUdpAdapter.run_lua_script`, which mirrors the USB chunking and print-polling |
 
 ### Transport facts worth knowing
 
